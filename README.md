@@ -90,7 +90,7 @@ The decomposition config controls:
 Example fields:
 
 - `input_file`
-- `artifact_file`
+- `artifact_relpath`
 - `output_dir`
 - `prompt_field`
 - `decompose_model`
@@ -99,6 +99,8 @@ Example fields:
 - `atomize`
 - `max_depth`
 - `min_span_chars`
+
+Use `output_dir` as the base folder for one run. Use `artifact_relpath` for the saved decomposition JSON inside that folder. If omitted, it defaults to `decomposition.json`.
 
 ## Visualization
 
