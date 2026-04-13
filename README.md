@@ -125,7 +125,7 @@ The HTML view shows:
 - Recursive decomposition is parent-local. Each refinement step works inside the current span.
 - `guided` mode biases labels toward a taxonomy.
 - `free` mode lets the model discover labels more freely while keeping the same tree contract.
-- The tree is generic; attribution can choose a frontier later, but decomposition itself does not depend on it.
+- The tree is generic; decomposition itself does not depend on any downstream consumer.
 
 ## Testing
 
@@ -134,4 +134,3 @@ Run the decomposition tests with:
 ```bash
 pytest prompt_shapley/tests/test_decompose.py
 ```
-
