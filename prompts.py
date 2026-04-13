@@ -19,10 +19,6 @@ FUNCTIONAL_COMPONENTS = [
     "input_slots",
 ]
 
-# Legacy labels kept for compatibility; recursive refinement is guided by
-# should_refine plus structural evidence rather than by node type alone.
-ATOMIZABLE_TYPES = {"rules", "procedure"}
-
 # ── LLM prompts ────────────────────────────────────────────────────────
 
 GUIDED_SEGMENT_SYSTEM = """\
@@ -50,6 +46,9 @@ Rules:
 - Prefer maximal coherent sections at the current scope, not tiny fragments.
 - Respect markdown and formatting cues such as headings, bullets, numbered lists,
   blockquotes, fenced code blocks, and placeholder-heavy lines.
+- A heading is usually an anchor for the block that follows, not a standalone
+  child segment. Do not emit heading-only children unless the heading itself is
+  the only meaningful content at this scope.
 - If you are decomposing inside an existing parent block, produce child segments
   that are meaningful within that parent rather than re-segmenting the entire prompt.
 - When a child block is a smaller piece of a parent rules/procedure section,
@@ -103,6 +102,9 @@ Rules:
   across similar prompts.
 - Respect markdown and formatting cues such as headings, bullets, numbered lists,
   blockquotes, fenced code blocks, and placeholder-heavy lines.
+- A heading is usually an anchor for the block that follows, not a standalone
+  child segment. Do not emit heading-only children unless the heading itself is
+  the only meaningful content at this scope.
 - If you are decomposing inside an existing parent block, produce child segments
   that are meaningful within that parent rather than re-segmenting the entire prompt.
 - Mark should_refine=true only when the segment contains multiple
@@ -131,37 +133,8 @@ Return strict JSON:
   }
 ]}"""
 
-# Backward-compatible alias for the original guided segmentation prompt name.
-SEGMENT_SYSTEM = GUIDED_SEGMENT_SYSTEM
-
 GUIDED_CHILD_SYSTEM = GUIDED_SEGMENT_SYSTEM
 FREE_CHILD_SYSTEM = FREE_SEGMENT_SYSTEM
-
-ATOMIZE_SYSTEM = """\
-You are a rule extraction agent. Given a text block from a prompt, extract \
-each individual rule, instruction, or constraint as a separate item.
-
-Rules:
-- Copy each rule VERBATIM from the source (no paraphrase, no summary).
-- Classify each rule's kind: constraint, requirement, guideline, heuristic.
-- Preserve numbering/bullets if present.
-- If a line is a section header (not a rule), skip it.
-- Return one item only when it is independently meaningful if toggled on/off.
-- Use boundary_cues to describe structural evidence such as numbered_list,
-  bullet_list, imperative_sentence, example_block, or inline_constraint.
-- anchor_phrases must be short exact substrings copied from the rule.
-
-Return strict JSON:
-{"rules": [
-  {
-    "content": "<verbatim rule text>",
-    "kind": "<constraint|requirement|guideline|heuristic>",
-    "reason": "<brief structural reason>",
-    "confidence": "<low|medium|high>",
-    "boundary_cues": ["<cue>", "..."],
-    "anchor_phrases": ["<exact phrase>", "..."]
-  }
-]}"""
 
 # ── Label normalization ────────────────────────────────────────────────
 

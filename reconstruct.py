@@ -172,21 +172,7 @@ def reconstruct(
     section_separator: str = "\n\n",
     rule_separator: str = "\n",
 ) -> str:
-    """Reconstruct prompt from flat components (backward compatible).
-
-    If components have parent_span metadata (from span-based decomposition),
-    uses span-based reconstruction for those groups.  Otherwise falls back
-    to simple text joining.
-
-    Args:
-        components: All available components.
-        enabled_ids: Component IDs to include.
-        section_separator: Separator between functional sections.
-        rule_separator: Separator between items within a section.
-
-    Returns:
-        Reconstructed prompt string.
-    """
+    """Reconstruct prompt from flat components."""
     if not enabled_ids:
         return ""
 

@@ -21,16 +21,6 @@ def get_roots(tree_data: Any) -> List[TreeNode]:
     return []
 
 
-def canonical_selector(selector: str) -> str:
-    """Normalize legacy selector names to the generic tree selectors."""
-    aliases = {
-        "segment": "top_level",
-        "rule": "leaves",
-        "leaf": "leaves",
-    }
-    return aliases.get(selector, selector)
-
-
 def iter_nodes(
     tree_data: Any,
     depth: int = 0,
@@ -50,7 +40,6 @@ def iter_nodes(
 
 
 def _matches_selector(node: TreeNode, depth: int, selector: str) -> bool:
-    selector = canonical_selector(selector)
     children = node.get("children", [])
 
     if selector == "top_level":
@@ -66,7 +55,7 @@ def _matches_selector(node: TreeNode, depth: int, selector: str) -> bool:
 
     raise ValueError(
         f"Unknown selector: {selector!r}. "
-        "Use 'top_level', 'leaves', 'depth:N', or legacy 'segment'/'rule'."
+        "Use 'top_level', 'leaves', or 'depth:N'."
     )
 
 

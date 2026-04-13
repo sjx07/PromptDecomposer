@@ -13,11 +13,11 @@ and every node references it by [start, end) character offsets.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Tuple
 
 from .align import _tokenize, align_to_source_details
 from .prompts import (
-    ATOMIZE_SYSTEM,
     FREE_CHILD_SYSTEM,
     FREE_SEGMENT_SYSTEM,
     GUIDED_CHILD_SYSTEM,
@@ -58,7 +58,38 @@ def _normalize_confidence(value: Any) -> str:
 
 def _looks_like_list_item(text: str) -> bool:
     stripped = text.strip()
-    return stripped.startswith(("- ", "* ")) or bool(__import__("re").match(r"^\d+\.\s", stripped))
+    return stripped.startswith(("- ", "* ")) or bool(re.match(r"^\d+\.\s", stripped))
+
+
+def _looks_like_heading(text: str) -> bool:
+    stripped = text.strip()
+    return (
+        bool(re.match(r"^\s{0,3}#{1,6}\s+\S", text))
+        or (stripped.startswith("<") and stripped.endswith(">") and " " not in stripped)
+        or (stripped.endswith(":") and not _looks_like_list_item(stripped))
+    )
+
+
+def _is_procedure_like_anchor(text: str) -> bool:
+    lowered = text.strip().lower()
+    return bool(
+        lowered
+        and (
+            "procedure" in lowered
+            or "workflow" in lowered
+            or "step-by-step" in lowered
+            or re.search(r"\bsteps?\b", lowered) is not None
+            or re.search(r"\bhow to\b", lowered) is not None
+        )
+    )
+
+
+def _strip_leading_anchor(units: List[str]) -> Tuple[List[str], List[str]]:
+    body = [unit.strip() for unit in units if unit.strip()]
+    anchor: List[str] = []
+    while body and _looks_like_heading(body[0]) and not _looks_like_list_item(body[0]):
+        anchor.append(body.pop(0))
+    return anchor, body
 
 
 def _default_should_refine(raw: Dict[str, Any], content: str) -> bool:
@@ -67,8 +98,11 @@ def _default_should_refine(raw: Dict[str, Any], content: str) -> bool:
     if len(lines) < 2:
         return False
 
+    if _is_procedure_like_anchor(lines[0]):
+        return False
+
     body = list(lines)
-    if body and body[0].endswith(":") and not _looks_like_list_item(body[0]):
+    if body and _looks_like_heading(body[0]):
         body = body[1:]
     if len(body) < 2:
         return False
@@ -240,6 +274,17 @@ class PromptDecomposer:
             label = self._normalize_segment_label(raw_label)
             boundary_cues = _string_list(raw.get("boundary_cues"))
             anchor_phrases = _string_list(raw.get("anchor_phrases"))
+            content_lines = [line.strip() for line in content.splitlines() if line.strip()]
+            if (
+                len(content_lines) == 1
+                and _looks_like_heading(content_lines[0])
+                and (
+                    "markdown_heading" in boundary_cues
+                    or "header" in boundary_cues
+                    or raw_label.endswith("_heading")
+                )
+            ):
+                continue
 
             match = align_to_source_details(
                 content,
@@ -292,10 +337,17 @@ class PromptDecomposer:
         *,
         top_level: bool,
         parent_span: Tuple[int, int] | None,
+        units: List[str],
     ) -> bool:
         if not aligned:
             return False
         if not top_level and len(aligned) < 2:
+            anchor, _ = _strip_leading_anchor(units)
+            if len(aligned) == 1 and parent_span is not None and anchor:
+                child_span = tuple(aligned[0]["span"])
+                parent_tuple = tuple(parent_span)
+                if child_span != parent_tuple and child_span[0] >= parent_tuple[0] and child_span[1] <= parent_tuple[1]:
+                    return True
             return False
 
         prev_end = None
@@ -345,18 +397,13 @@ class PromptDecomposer:
         }
 
     def _looks_like_flat_atomic_block(self, units: List[str]) -> bool:
-        body = [unit.strip() for unit in units if unit.strip()]
+        anchor, body = _strip_leading_anchor(units)
         if len(body) < 2:
             return False
-        if body[0].endswith(":") and not _looks_like_list_item(body[0]):
-            body = body[1:]
-        if len(body) < 1:
+        if anchor and _is_procedure_like_anchor(anchor[0]):
             return False
         list_like = sum(1 for unit in body if _looks_like_list_item(unit))
         return list_like >= 1 and list_like == len(body)
-
-    def _should_legacy_atomize(self, node: Dict[str, Any], units: List[str]) -> bool:
-        return bool(node.get("metadata", {}).get("should_refine", False)) and self._looks_like_flat_atomic_block(units)
 
     def _should_recurse(self, node: Dict[str, Any], units: List[str], depth: int) -> bool:
         if not self.atomize:
@@ -368,101 +415,6 @@ class PromptDecomposer:
         if (node["span"][1] - node["span"][0]) < self.min_span_chars and not self._looks_like_flat_atomic_block(units):
             return False
         return bool(node.get("metadata", {}).get("should_refine", False))
-
-    def _request_atomize(self, section_text: str) -> List[Dict]:
-        """Ask the LLM to extract individual rules from a local section."""
-        result = call_llm_json(
-            self.client,
-            self.model,
-            ATOMIZE_SYSTEM,
-            f"Section text:\n{section_text}",
-            self.temperature,
-            usage_callback=self._record_usage,
-        )
-        return result.get("rules", [])
-
-    def _legacy_atomize_children(
-        self,
-        prompt_id: str,
-        prompt: str,
-        parent: Dict[str, Any],
-        units: List[str],
-        unit_tokens: List[List[str]],
-        unit_spans: List[Tuple[int, int]],
-        depth: int,
-    ) -> List[Dict[str, Any]]:
-        """Fallback atomization for simple rule/procedure blocks."""
-        section_text = prompt[parent["span"][0]:parent["span"][1]]
-        if not section_text.strip():
-            return []
-
-        llm_rules = self._request_atomize(section_text)
-        children: List[Dict[str, Any]] = []
-        cursor = 0
-        seen_spans: set[tuple[int, int]] = set()
-
-        for raw in llm_rules:
-            if not isinstance(raw, dict):
-                continue
-            content = str(raw.get("content", "")).strip()
-            if not content:
-                continue
-
-            boundary_cues = _string_list(raw.get("boundary_cues"))
-            anchor_phrases = _string_list(raw.get("anchor_phrases"))
-            match = align_to_source_details(
-                content,
-                units,
-                unit_tokens,
-                min_start=cursor,
-                anchor_phrases=anchor_phrases,
-                boundary_cues=boundary_cues,
-            )
-            if match is None and cursor > 0:
-                match = align_to_source_details(
-                    content,
-                    units,
-                    unit_tokens,
-                    min_start=0,
-                    anchor_phrases=anchor_phrases,
-                    boundary_cues=boundary_cues,
-                )
-            if match is None or bool(match["ambiguous"]):
-                continue
-
-            start_unit = int(match["start"])
-            end_unit = int(match["end"])
-            char_span = units_to_char_span(unit_spans, start_unit, end_unit)
-            span_key = (char_span[0], char_span[1])
-            if span_key in seen_spans:
-                continue
-            seen_spans.add(span_key)
-            cursor = max(cursor, end_unit + 1)
-
-            node_type = parent["type"]
-            child = {
-                "id": _child_id(parent["id"], node_type, list(char_span)),
-                "type": node_type,
-                "kind": str(raw.get("kind", "rule")).lower(),
-                "span": list(char_span),
-                "metadata": {
-                    "depth": depth,
-                    "mode": self.mode,
-                    "parent_id": parent["id"],
-                    "reason": str(raw.get("reason", "")).strip(),
-                    "confidence": _normalize_confidence(raw.get("confidence")),
-                    "boundary_cues": boundary_cues,
-                    "anchor_phrases": anchor_phrases,
-                    "alignment_score": float(match["score"]),
-                    "alignment_exact": bool(match["exact"]),
-                    "alignment_margin": float(match["margin"]),
-                    "alignment_ambiguous": bool(match["ambiguous"]),
-                    "structural_hints": summarize_cues(units[start_unit : end_unit + 1]),
-                },
-            }
-            children.append(child)
-
-        return children
 
     def _decompose_scope(
         self,
@@ -492,7 +444,7 @@ class PromptDecomposer:
             (unit_spans[0][0], unit_spans[-1][1])
             if unit_spans else None
         )
-        if not self._is_valid_split(aligned, top_level=top_level, parent_span=parent_span):
+        if not self._is_valid_split(aligned, top_level=top_level, parent_span=parent_span, units=units):
             return []
 
         tree: List[Dict[str, Any]] = []
@@ -521,16 +473,6 @@ class PromptDecomposer:
                     parent_type=node["type"],
                     top_level=False,
                 )
-                if not children and self._should_legacy_atomize(node, child_units):
-                    children = self._legacy_atomize_children(
-                        prompt_id,
-                        prompt,
-                        node,
-                        child_units,
-                        child_tokens,
-                        child_spans,
-                        depth + 1,
-                    )
                 if children:
                     node["children"] = children
             tree.append(node)
