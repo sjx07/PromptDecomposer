@@ -1,56 +1,33 @@
-# Decompose
+# PromptDecomposer
 
-`prompt_shapley.decompose` turns raw prompts into a tree-shaped decomposition IR.
-It is standalone: it does not require attribution or Shapley computation.
+`decompose/` turns raw prompt text into a tree. This package is only about decomposition.
 
-## What It Produces
+If you are using the full repo, the decomposition settings are usually passed through the top-level runner. If you are using this package on its own, the Python API below is the main entrypoint.
 
-The decomposition result is a prompt-aligned tree with span offsets:
+## The Files That Matter
 
-- `DecompositionResult.prompts`: original prompt strings
-- `DecompositionResult.trees`: serialized span trees
-- `DecompositionResult.root_nodes()`: root nodes as `DecompositionNode`
-- `DecompositionResult.select_nodes(selector)`: projected frontier for a given selector
+- `pipeline.py`
+  Main recursive decomposition logic.
+- `models.py`
+  `DecompositionNode` and `DecompositionResult`.
+- `prompts.py`
+  LLM prompts used for segmentation and refinement.
+- `align.py`
+  Maps model output back to exact text spans.
+- `structure.py`
+  Extracts structural hints such as headings and lists.
+- `tree.py`
+  Tree traversal and selector helpers.
+- `reconstruct.py`
+  Rebuilds prompt text from selected nodes.
+- `batch.py`
+  Batch processing, caching, and usage accounting helpers.
 
-Each node stores:
-
-- `id`
-- `span = [start, end)`
-- `type`
-- `kind` when the extractor emits a finer label
-- `children`
-- optional `metadata`
-
-Spans always refer back to the original prompt text. The tree is the source of truth.
-
-## Public API
-
-Use the package entrypoints from `prompt_shapley.decompose`:
-
-- `decompose_prompt(prompt, ...)`
-- `decompose_prompts(prompts, ...)`
-- `decompose_corpus(prompts, ...)`
-- `PromptDecomposer`
-- `DecompositionResult`
-
-Typical configuration knobs:
-
-- `model`: decomposition model
-- `provider`: model provider
-- `mode`: `guided` or `free`
-- `atomize`: enable recursive refinement
-- `max_depth`: recursion limit
-- `min_span_chars`: minimum span size before refinement
-
-## Quick Start
-
-### Decompose one prompt
+## Direct Python Usage
 
 ```python
-from pathlib import Path
-from prompt_shapley.decompose import decompose_prompt
+from decompose import decompose_prompt
 
-prompt = Path("template.txt").read_text()
 result = decompose_prompt(
     prompt,
     model="gpt-5.4",
@@ -60,77 +37,92 @@ result = decompose_prompt(
     max_depth=5,
     min_span_chars=60,
 )
-
-print(result.summary())
-print(result.root_nodes())
 ```
 
-### Render the tree to HTML
+Useful result methods:
 
-```python
-html = result.to_tree_html(title="Template decomposition")
-Path("decomposition.html").write_text(html)
-```
+- `summary()`
+- `root_nodes()`
+- `select_nodes(selector)`
+- `to_dict()`
 
-### Run over a corpus
+## The Main Knobs
 
-```python
-from prompt_shapley.decompose import decompose_corpus
+### `mode`
 
-prompts = ["...", "..."]
-result = decompose_corpus(prompts, mode="guided", atomize=True)
-```
+- `guided`
+  More stable labels and structure.
+- `free`
+  More open labels and freer grouping.
 
-## Batch Decomposition
+Use `guided` when you want consistency across prompts.
+Use `free` when you want the model to discover structure more openly.
 
-For larger corpora, use the batch runner:
+### `atomize`
 
-```bash
-python scripts/run_decompose_corpus.py \
-  --input-file decompose/tasks/claudecode.json \
-  --prompt-field full_text \
-  --model gpt-5.4 \
-  --mode free \
-  --batch-size 10
-```
+If `True`, the decomposer can keep refining nodes into smaller parts.
 
-The batch runner writes:
+### `max_depth`
 
-- `decompositions.jsonl` for per-prompt results
-- `summary.json` for aggregate metrics
-- cached decomposition entries under `.cache/decompose/`
+Caps recursion depth.
+Increase it when the tree stops too early.
+Lower it when the tree is getting too fragmented.
 
-Use `--force` to re-send prompts even if a cache entry exists.
+### `min_span_chars`
 
-## Inspecting Results
+Prevents the decomposer from trying to split very small spans.
+Increase it when the tree is over-splitting.
 
-For a saved decomposition record, render an HTML view with:
+## Using It Through The Repo Scripts
 
-```bash
-python scripts/render_decomposition_html.py \
-  --input-file results/.../decompositions.jsonl \
-  --source-index 0 \
-  --output-file results/.../view.html
-```
+In the host repo, decomposition is usually run either through:
 
-The HTML view shows:
+- [`../scripts/run_prompt_shapley.py`](../scripts/run_prompt_shapley.py)
+- [`../scripts/run_decompose_corpus.py`](../scripts/run_decompose_corpus.py)
 
-- the original prompt
-- the decomposition tree
-- node spans and metadata
-- navigation and source metadata when available
+The decomposition config controls:
 
-## Design Notes
+- input source
+- output location
+- model/provider
+- recursion behavior
 
-- Recursive decomposition is parent-local. Each refinement step works inside the current span.
-- `guided` mode biases labels toward a taxonomy.
-- `free` mode lets the model discover labels more freely while keeping the same tree contract.
-- The tree is generic; decomposition itself does not depend on any downstream consumer.
+Example fields:
 
-## Testing
+- `input_file`
+- `artifact_file`
+- `output_dir`
+- `prompt_field`
+- `decompose_model`
+- `decompose_provider`
+- `mode`
+- `atomize`
+- `max_depth`
+- `min_span_chars`
 
-Run the decomposition tests with:
+## Visualization
 
-```bash
-pytest prompt_shapley/tests/test_decompose.py
-```
+Decomposition itself only produces data.
+HTML inspection belongs to the visualization layer in the host repo.
+
+For stored results, the useful tools are:
+
+- [`../scripts/render_decomposition_html.py`](../scripts/render_decomposition_html.py)
+- [`../scripts/serve_decompositions.py`](../scripts/serve_decompositions.py)
+
+Use the viewer to check:
+
+- whether headings became their own nodes incorrectly
+- whether procedures were split too aggressively
+- whether the tree depth is sensible
+
+## Practical Debugging Order
+
+When decomposition looks wrong, inspect files in this order:
+
+1. `prompts.py`
+2. `pipeline.py`
+3. `align.py`
+4. `structure.py`
+
+That is usually where behavior issues come from.

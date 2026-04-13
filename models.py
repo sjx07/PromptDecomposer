@@ -115,15 +115,3 @@ class DecompositionResult:
             return "\n".join(lines)
 
         return f"Decomposed {len(self.prompts)} prompt(s) with no tree nodes."
-
-    def to_tree_html(self, title: str = "Prompt Decomposition", prompt_idx: int = 0) -> str:
-        """Render the stored tree as interactive HTML."""
-        if not self.prompts or not self.trees:
-            raise ValueError("No decomposition tree available.")
-        from prompt_shapley.viz import decomposition_html
-
-        return decomposition_html(
-            self.prompts[prompt_idx],
-            self.trees[prompt_idx].get("tree", []),
-            title=title,
-        )
