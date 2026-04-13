@@ -90,8 +90,8 @@ The decomposition config controls:
 Example fields:
 
 - `input_file`
-- `artifact_name`
 - `output_dir`
+- `artifact_name`
 - `prompt_field`
 - `decompose_model`
 - `decompose_provider`
@@ -100,7 +100,9 @@ Example fields:
 - `max_depth`
 - `min_span_chars`
 
-Use `output_dir` as the base folder for one run. Use `output_dir` for the saved decomposition JSON inside that folder. If omitted, it defaults to `decomposition.json`.
+Use `output_dir` as the base folder for one run. Use `artifact_name` for the saved decomposition JSON inside that folder. If omitted, it defaults to `decomposition.json`.
+
+When the full runner is used, it also writes `decomposition.html` in the same `output_dir`.
 
 ## Visualization
 
