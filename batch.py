@@ -14,7 +14,7 @@ MODEL_PRICING_PER_MILLION: Dict[str, Dict[str, float]] = {
     "gpt-5.4": {"input": 2.50, "output": 15.00},
     "gpt-5.4-mini": {"input": 0.75, "output": 4.50},
 }
-DECOMPOSE_CACHE_VERSION = "decompose-cache-v1"
+DECOMPOSE_CACHE_VERSION = "decompose-cache-v8"
 
 
 def normalize_model_name(model: str) -> str:

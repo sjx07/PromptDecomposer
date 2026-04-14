@@ -16,19 +16,65 @@ import logging
 from typing import Any, Dict, List, Tuple
 
 from .align import _tokenize, align_to_source_details
+from .postprocess import postprocess_tree
 from .prompts import (
     ATOMIZE_SYSTEM,
     FREE_CHILD_SYSTEM,
     FREE_SEGMENT_SYSTEM,
     GUIDED_CHILD_SYSTEM,
     GUIDED_SEGMENT_SYSTEM,
-    normalize_free_label,
-    normalize_label,
 )
-from .structure import format_structure_hints, summarize_cues
+from .refine import (
+    looks_like_list_item as _is_list_item_start,
+    normalize_confidence as _normalize_confidence,
+    string_list as _string_list,
+)
+from .structure import (
+    build_structure_candidates,
+    format_structure_candidates,
+    format_structure_hints,
+    summarize_cues,
+)
+from .structure_constraints import align_segments_to_source
 from .utils import call_llm_json, split_units, units_to_char_span
 
 logger = logging.getLogger(__name__)
+
+_STRUCTURAL_LIST_KINDS = {"header_list", "list_block"}
+_ATOMIZABLE_LIST_TERMS = {
+    "constraint",
+    "critical",
+    "do_not",
+    "guidance",
+    "guideline",
+    "exclusion",
+    "inclusion",
+    "instruction",
+    "practice",
+    "prohibition",
+    "requirement",
+    "rule",
+    "tip",
+}
+_COHERENT_LIST_TERMS = {
+    "catalog",
+    "demo",
+    "domain_scope",
+    "example",
+    "few_shot",
+    "format",
+    "mechanic",
+    "phase",
+    "priority",
+    "schema",
+    "source",
+    "step",
+    "strength",
+    "table",
+    "tool_list",
+    "workflow",
+    "xml",
+}
 
 
 def _span_str(span: List[int]) -> str:
@@ -41,51 +87,6 @@ def _node_id(prompt_id: str, node_type: str, span: List[int]) -> str:
 
 def _child_id(parent_id: str, node_type: str, span: List[int]) -> str:
     return f"{parent_id}/{node_type}[{_span_str(span)}]"
-
-
-def _string_list(value: Any) -> List[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]
-
-
-def _normalize_confidence(value: Any) -> str:
-    confidence = str(value or "").strip().lower()
-    if confidence in {"low", "medium", "high"}:
-        return confidence
-    return "medium"
-
-
-def _looks_like_list_item(text: str) -> bool:
-    stripped = text.strip()
-    return stripped.startswith(("- ", "* ")) or bool(__import__("re").match(r"^\d+\.\s", stripped))
-
-
-def _default_should_refine(raw: Dict[str, Any], content: str) -> bool:
-    cues = set(_string_list(raw.get("boundary_cues")))
-    lines = [line.strip() for line in content.splitlines() if line.strip()]
-    if len(lines) < 2:
-        return False
-
-    body = list(lines)
-    if body and body[0].endswith(":") and not _looks_like_list_item(body[0]):
-        body = body[1:]
-    if len(body) < 2:
-        return False
-
-    list_like = sum(1 for line in body if _looks_like_list_item(line))
-    if list_like >= 2 and list_like == len(body):
-        return True
-    if "header" in cues and list_like >= 2:
-        return True
-    return False
-
-
-def _should_refine(raw: Dict[str, Any], content: str) -> bool:
-    explicit = raw.get("should_refine")
-    if isinstance(explicit, bool):
-        return explicit
-    return _default_should_refine(raw, content)
 
 
 class PromptDecomposer:
@@ -166,6 +167,7 @@ class PromptDecomposer:
             parent_type=None,
             top_level=True,
         )
+        tree = self._postprocess_tree(prompt_id, prompt, tree)
         return {"prompt": prompt, "tree": tree}
 
     def _segment_system(self, depth: int = 0) -> str:
@@ -180,14 +182,26 @@ class PromptDecomposer:
         units: List[str],
         depth: int,
         parent_type: str | None,
+        structural_candidates: List[Dict[str, Any]] | None = None,
     ) -> str:
         scope = "top-level prompt" if depth == 0 else f"child scope inside parent label={parent_type or 'unknown'}"
         structural_hints = format_structure_hints(units)
+        structural_candidate_block = ""
+        if structural_candidates:
+            structural_candidate_block = (
+                "Structural candidate spans (hard boundaries, not labels):\n"
+                f"{format_structure_candidates(units, structural_candidates)}\n\n"
+                "Return exactly one segment per structural candidate span_id. "
+                "Use the span_id values as given, copy each candidate's content "
+                "verbatim, and choose the semantic label yourself. The candidate "
+                "kind is only boundary evidence.\n\n"
+            )
         numbered = "\n".join(f"[{i}] {unit}" for i, unit in enumerate(units))
         return (
             f"Current scope: {scope}\n"
             f"Depth: {depth}\n"
             f"Observed structural hints:\n{structural_hints}\n\n"
+            f"{structural_candidate_block}"
             f"Prompt lines:\n{numbered}"
         )
 
@@ -197,24 +211,18 @@ class PromptDecomposer:
         *,
         depth: int,
         parent_type: str | None,
+        structural_candidates: List[Dict[str, Any]] | None = None,
     ) -> List[Dict]:
         """Ask the LLM to segment the current scope into child blocks."""
         result = call_llm_json(
             self.client,
             self.model,
             self._segment_system(depth),
-            self._segment_user_message(units, depth, parent_type),
+            self._segment_user_message(units, depth, parent_type, structural_candidates),
             self.temperature,
             usage_callback=self._record_usage,
         )
         return result.get("segments", [])
-
-    def _normalize_segment_label(self, label: str) -> str:
-        if self.mode == "guided":
-            return normalize_label(label)
-        if self.mode == "free":
-            return normalize_free_label(label)
-        raise ValueError(f"Unsupported decomposition mode: {self.mode!r}")
 
     def _align_segments(
         self,
@@ -224,67 +232,17 @@ class PromptDecomposer:
         llm_segments: List[Dict],
         *,
         reject_ambiguous: bool,
+        structural_candidates: List[Dict[str, Any]] | None = None,
     ) -> List[Dict[str, Any]]:
-        """Align LLM child segments to the current local scope."""
-        aligned: List[Dict[str, Any]] = []
-        cursor = 0
-
-        for raw in llm_segments:
-            if not isinstance(raw, dict):
-                continue
-            content = str(raw.get("content", "")).strip()
-            if not content:
-                continue
-
-            raw_label = str(raw.get("label", "unknown")).strip()
-            label = self._normalize_segment_label(raw_label)
-            boundary_cues = _string_list(raw.get("boundary_cues"))
-            anchor_phrases = _string_list(raw.get("anchor_phrases"))
-
-            match = align_to_source_details(
-                content,
-                units,
-                unit_tokens,
-                min_start=cursor,
-                anchor_phrases=anchor_phrases,
-                boundary_cues=boundary_cues,
-            )
-            if match is None and cursor > 0:
-                match = align_to_source_details(
-                    content,
-                    units,
-                    unit_tokens,
-                    min_start=0,
-                    anchor_phrases=anchor_phrases,
-                    boundary_cues=boundary_cues,
-                )
-            if match is None:
-                continue
-            if reject_ambiguous and bool(match["ambiguous"]):
-                continue
-
-            start_unit = int(match["start"])
-            end_unit = int(match["end"])
-            char_span = units_to_char_span(unit_spans, start_unit, end_unit)
-            cursor = max(cursor, end_unit + 1)
-
-            aligned.append({
-                "type": label,
-                "span": list(char_span),
-                "unit_range": [start_unit, end_unit],
-                "score": float(match["score"]),
-                "alignment_exact": bool(match["exact"]),
-                "alignment_margin": float(match["margin"]),
-                "alignment_ambiguous": bool(match["ambiguous"]),
-                "raw_label": raw_label,
-                "reason": str(raw.get("reason", "")).strip(),
-                "confidence": _normalize_confidence(raw.get("confidence")),
-                "should_refine": _should_refine(raw, content),
-                "boundary_cues": boundary_cues,
-                "anchor_phrases": anchor_phrases,
-            })
-
-        return aligned
+        return align_segments_to_source(
+            units,
+            unit_tokens,
+            unit_spans,
+            llm_segments,
+            mode=self.mode,
+            reject_ambiguous=reject_ambiguous,
+            structural_candidates=structural_candidates,
+        )
 
     def _is_valid_split(
         self,
@@ -340,23 +298,55 @@ class PromptDecomposer:
                 "alignment_margin": record.get("alignment_margin", 0.0),
                 "alignment_ambiguous": record.get("alignment_ambiguous", False),
                 "structural_hints": summarize_cues(local_units),
+                "structural_candidate": record.get("structural_candidate"),
             },
             "children": [],
         }
 
-    def _looks_like_flat_atomic_block(self, units: List[str]) -> bool:
-        body = [unit.strip() for unit in units if unit.strip()]
-        if len(body) < 2:
+    def _list_item_start_count(self, units: List[str]) -> int:
+        return sum(1 for unit in units if _is_list_item_start(unit))
+
+    def _structural_candidate_kind(self, node: Dict[str, Any]) -> str:
+        candidate = node.get("metadata", {}).get("structural_candidate") or {}
+        return str(candidate.get("kind", ""))
+
+    def _atomization_label_text(self, node: Dict[str, Any]) -> str:
+        metadata = node.get("metadata", {})
+        parts = [
+            str(node.get("type", "")),
+            str(metadata.get("raw_label", "")),
+            str(metadata.get("title", "")),
+        ]
+        return " ".join(parts).lower().replace("-", "_").replace(" ", "_")
+
+    def _is_coherent_structural_list(self, node: Dict[str, Any]) -> bool:
+        label_text = self._atomization_label_text(node)
+        return any(term in label_text for term in _COHERENT_LIST_TERMS)
+
+    def _has_atomizable_list_label(self, node: Dict[str, Any]) -> bool:
+        label_text = self._atomization_label_text(node)
+        return any(term in label_text for term in _ATOMIZABLE_LIST_TERMS)
+
+    def _should_atomize_structural_list(
+        self,
+        node: Dict[str, Any],
+        units: List[str],
+        depth: int,
+    ) -> bool:
+        if not self.atomize:
             return False
-        if body[0].endswith(":") and not _looks_like_list_item(body[0]):
-            body = body[1:]
-        if len(body) < 1:
+        if depth + 1 >= self.max_depth:
             return False
-        list_like = sum(1 for unit in body if _looks_like_list_item(unit))
-        return list_like >= 1 and list_like == len(body)
+        if self._structural_candidate_kind(node) not in _STRUCTURAL_LIST_KINDS:
+            return False
+        if self._list_item_start_count(units) < 2:
+            return False
+        if self._is_coherent_structural_list(node):
+            return False
+        return self._has_atomizable_list_label(node)
 
     def _should_legacy_atomize(self, node: Dict[str, Any], units: List[str]) -> bool:
-        return bool(node.get("metadata", {}).get("should_refine", False)) and self._looks_like_flat_atomic_block(units)
+        return bool(node.get("metadata", {}).get("should_refine", False)) and self._list_item_start_count(units) >= 2
 
     def _should_recurse(self, node: Dict[str, Any], units: List[str], depth: int) -> bool:
         if not self.atomize:
@@ -365,7 +355,12 @@ class PromptDecomposer:
             return False
         if len(units) < 2:
             return False
-        if (node["span"][1] - node["span"][0]) < self.min_span_chars and not self._looks_like_flat_atomic_block(units):
+        if (
+            self._structural_candidate_kind(node) in _STRUCTURAL_LIST_KINDS
+            and self._is_coherent_structural_list(node)
+        ):
+            return False
+        if (node["span"][1] - node["span"][0]) < self.min_span_chars and self._list_item_start_count(units) < 2:
             return False
         return bool(node.get("metadata", {}).get("should_refine", False))
 
@@ -464,6 +459,14 @@ class PromptDecomposer:
 
         return children
 
+    def _postprocess_tree(
+        self,
+        prompt_id: str,
+        prompt: str,
+        tree: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        return postprocess_tree(prompt_id, prompt, tree)
+
     def _decompose_scope(
         self,
         prompt_id: str,
@@ -480,13 +483,20 @@ class PromptDecomposer:
         if not units:
             return []
 
-        llm_segments = self._request_segments(units, depth=depth, parent_type=parent_type)
+        structural_candidates = build_structure_candidates(units)
+        llm_segments = self._request_segments(
+            units,
+            depth=depth,
+            parent_type=parent_type,
+            structural_candidates=structural_candidates,
+        )
         aligned = self._align_segments(
             units,
             unit_tokens,
             unit_spans,
             llm_segments,
             reject_ambiguous=not top_level,
+            structural_candidates=structural_candidates,
         )
         parent_span = (
             (unit_spans[0][0], unit_spans[-1][1])
@@ -509,6 +519,7 @@ class PromptDecomposer:
                 parent_id=parent_id,
                 local_units=child_units,
             )
+            children: List[Dict[str, Any]] = []
             if self._should_recurse(node, child_units, depth):
                 children = self._decompose_scope(
                     prompt_id,
@@ -531,8 +542,18 @@ class PromptDecomposer:
                         child_spans,
                         depth + 1,
                     )
-                if children:
-                    node["children"] = children
+            if not children and self._should_atomize_structural_list(node, child_units, depth):
+                children = self._legacy_atomize_children(
+                    prompt_id,
+                    prompt,
+                    node,
+                    child_units,
+                    child_tokens,
+                    child_spans,
+                    depth + 1,
+                )
+            if children:
+                node["children"] = children
             tree.append(node)
 
         return tree
