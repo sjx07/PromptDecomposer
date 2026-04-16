@@ -1,3 +1,5 @@
 /tasks
 /__pycache__
 AGENTS.md
+.omc
+/tests
